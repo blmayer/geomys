@@ -1,0 +1,849 @@
+#!/bin/sh
+
+version="0.1.0"
+
+usage() {
+	echo "geomys v$version: Browse the gopher web on the terminal."
+	echo ""
+	echo "Usage: geomys [URL]|[OPTION]"
+	echo ""
+	echo "Options:"
+	echo "  -h, --help		show this help"
+	echo "  -v, --version		show version info"
+	echo ""
+	echo "Configuration:"
+	echo "You can setup a config file at ~/.config/geomys/geomys.conf to configure *geomys* the way you like."
+	echo ""
+	echo "Commands:"
+	echo "These are the default keybindings to use while running geomys:"
+	echo ""
+	echo "  q	quit"
+	echo "  g	go to a link"
+	echo "  r	reload current page"
+	echo "  b	go back one page"
+	echo "  u	jump one path segment up"
+	echo "  o	open an address"
+	echo "  s	save current page"
+	echo "  H	go to homepage"
+	echo "  m	add bookmark"
+	echo "  M	go to a bookmark"
+	echo "  K	remove bookmark for current url"
+	echo ""
+	echo "Examples:"
+	echo "  geomys		Start browsing the default webpage"
+	echo "  geomys url	Start browsing url"
+	echo "  geomys --help	Show help"
+	echo ""
+	echo "Report bugs to: bleemayer@gmail.com"
+	echo "Home page: <https://www.github.com/blmayer/geomys/>"
+}
+
+version() {
+	echo "geomys $version"
+	echo ""
+	echo "Copyright (C) 2026 Brian Mayer."
+	echo "License MIT: MIT License <https://opensource.org/licenses/MIT>"
+	echo "THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND,"
+	echo "EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF"
+	echo "MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT."
+	echo ""
+	echo "Written by Brian Lee Mayer."
+}
+
+debug() {
+	[ "$debug" ] && echo "DEBUG: $*" >&2 && sleep "$debug"
+}
+
+# Parse arguments
+debug "parsing args"
+while [ "$1" ]
+do
+	case $1 in
+		"-v")
+			debug=1
+			;;
+		"-h" | "--help")
+			usage
+			exit 0
+			;;
+		"--version")
+			version
+			exit 0
+			;;
+		"-f"|"--file")
+			shift
+			file="$1"
+			;;
+		"")
+			break
+			;;
+		*)
+			url="$1"
+			;;
+	esac
+	shift
+done
+
+# Save terminal
+tput smcup
+
+# Configuration
+confighome=${XDG_CONFIG_HOME:-$HOME/.config}
+mkdir -p "$confighome/geomys"
+configfile="$confighome/geomys/geomys.conf"
+bookmarkfile="$confighome/geomys/bookmarks"
+
+cachedir="${XDG_CACHE_HOME:-$HOME/.cache}/geomys"
+
+# Default values
+
+# user config
+margin=8
+homepage="gopher.floodgap.com/1/"
+
+# keybindings
+openkey='o'
+openlocalkey='O'
+gokey='g'
+refreshkey='r'
+backkey='b'
+quitkey='q'
+markkey='m'
+gomarkkey='M'
+delmarkkey='K'
+goupkey='u'
+homekey='H'
+savekey='s'
+
+# styles
+sty_info='\033[2m'
+sty_error='\033[31;1m'
+sty_linkb='\033[35m'
+sty_linkt=' => \033[36;3m '
+sty_search='\033[33;1m'
+sty_searcht=' ? \033[36;3m '
+sty_dir='\033[34;1m'
+sty_text='\033[0m'
+sty_bin='\033[31m'
+sty_html='\033[32m'
+sty_image='\033[33m'
+
+if [ ! -s "$configfile" ]
+then
+	# Default values
+	cat <<- EOF > "$configfile"
+	# where to store temp files
+	cachedir="$cachedir"
+
+	# user config
+	margin=8
+	homepage="gopher.floodgap.com/1/"
+
+	# keybindings
+	openkey='o'
+	openlocalkey='O'
+	gokey='g'
+	refreshkey='r'
+	backkey='b'
+	quitkey='q'
+	markkey='m'
+	gomarkkey='M'
+	delmarkkey='K'
+	goupkey='u'
+	homekey='H'
+	savekey='s'
+
+	# styles
+	sty_info='\033[2m'
+	sty_error='\033[31;1m'
+	sty_linkb='\033[35m'
+	sty_linkt=' => \033[36;3m '
+	sty_search='\033[33;1m'
+	sty_searcht=' ? \033[36;3m '
+	sty_dir='\033[34;1m'
+	sty_text='\033[0m'
+	sty_bin='\033[31m'
+	sty_html='\033[32m'
+	sty_image='\033[33m'
+	EOF
+fi
+
+# shellcheck source=/dev/null
+. "$configfile"
+
+mkdir -p "$cachedir"
+pagefile="$(mktemp -p "$cachedir" -t curpage.XXXXXX)"
+rawfile="$(mktemp -p "$cachedir" -t rawpage.XXXXXX)"
+histfile="$(mktemp -p "$cachedir" -t history.XXXXXX)"
+linksfile="$(mktemp -p "$cachedir" -t links.XXXXXX)"
+tracefile="$(mktemp -p "$cachedir" -t trace.XXXXXX)"
+debug "read configs"
+
+# Restore terminal
+thetrap() {
+	rm -f "$histfile" "$linksfile" "$pagefile" "$rawfile" "$tracefile" > /dev/null 2>&1
+	tput rmcup
+	printf "\033[?25h"
+	stty echo
+	exit
+}
+
+trap thetrap EXIT INT HUP
+
+# Drop last line of a file (portable; BSD sed -i needs '', GNU does not)
+droplast() {
+	[ -s "$1" ] || return
+	sed '$d' "$1" > "$1.tmp" && mv "$1.tmp" "$1"
+}
+
+getprevious() {
+	# Remove current page, then take and remove the previous entry
+	droplast "$histfile"
+	prev="$(tail -n 1 "$histfile" 2>/dev/null)"
+	droplast "$histfile"
+	echo "$prev"
+}
+
+# Returns the complete url scheme with gopher defaults
+# Parameters: url
+# Gopher URL format: gopher://host[:port]/type][/selector]
+# See RFC 4266
+parseurl() {
+	debug "parsing: $url oldhost: $oldhost oldselector: $oldselector"
+	proto="$(echo "$url" | grep :// | sed -e 's,^\(.*://\).*,\1,g')"
+	if [ "$proto" ]
+	then
+		url="$(echo "$url" | sed -e "s@$proto@@g")"
+	else
+		if [ "$oldhost" ]
+		then
+			case "$url" in
+				"/"*) url="$oldhost$url" ;;
+				*)
+					# relative selector under current host
+					url="$oldhost${oldselector%/*}/$url"
+					;;
+			esac
+		fi
+	fi
+	debug "url: $url"
+
+	proto="$(echo "$proto" | sed -e 's,://,,g')"
+	hostport="$(echo "$url" | cut -d/ -f1)"
+	host="$(echo "$hostport" | sed -e 's,:.*,,g')"
+	port="$(echo "$hostport" | sed -e 's,^.*:,:,g' -e 's,.*:\([0-9]*\).*,\1,g' -e 's,[^0-9],,g')"
+	rest="$(echo "$url" | sed "s@^$hostport@@")"
+
+	# First character after host is item type, rest is selector
+	# e.g. /1/foo/bar -> type=1, selector=/foo/bar
+	# e.g. /0/readme  -> type=0, selector=/readme
+	# e.g. /          -> type=1, selector=
+	# e.g. (empty)    -> type=1, selector=
+	if [ -z "$rest" ] || [ "$rest" = "/" ]
+	then
+		itype="1"
+		selector=""
+	else
+		# strip leading /
+		rest="${rest#/}"
+		itype="$(printf '%s' "$rest" | cut -c1)"
+		selector="$(printf '%s' "$rest" | cut -c2-)"
+	fi
+
+	# Validate item type is a single known character; if not treat whole as selector
+	case "$itype" in
+		[0-9a-zA-Z+]) ;;
+		*)
+			itype="1"
+			selector="/$rest"
+			;;
+	esac
+
+	debug "parsed: proto: ${proto:-gopher} host: $host port: ${port:-70} type: $itype selector: $selector"
+	echo "${proto:-gopher}" "$host" "${port:-70}" "$itype" "$selector"
+}
+
+# Human-readable prefix for item types
+itype_label() {
+	case "$1" in
+		0) echo "TXT" ;;
+		1) echo "DIR" ;;
+		2) echo "CSO" ;;
+		3) echo "ERR" ;;
+		4) echo "HQX" ;;
+		5) echo "DOS" ;;
+		6) echo "UUE" ;;
+		7) echo "???" ;;
+		8) echo "TEL" ;;
+		9) echo "BIN" ;;
+		g) echo "GIF" ;;
+		h) echo "HTM" ;;
+		i) echo "   " ;;
+		I) echo "IMG" ;;
+		s) echo "SND" ;;
+		T) echo "3270" ;;
+		+) echo "DUP" ;;
+		*) echo "???" ;;
+	esac
+}
+
+typesetgopher() {
+	# some setup first
+	[ -f "$linksfile" ] && rm "$linksfile"
+	cols=$(tput cols)
+	linkcount="0"
+
+	# shellcheck disable=SC2154
+	width=$((cols - (2*margin)))
+	debug "text width: $width"
+
+	while IFS='' read -r line || [ -n "$line" ];
+	do
+		line="$(printf "%s" "$line" | tr -d '\r')"
+
+		# End of menu marker
+		[ "$line" = "." ] && continue
+		[ -z "$line" ] && continue
+
+		# Gopher menu line: type + display + TAB + selector + TAB + host + TAB + port
+		itype="$(printf '%s' "$line" | cut -c1)"
+		rest="$(printf '%s' "$line" | cut -c2-)"
+
+		display="$(printf '%s' "$rest" | cut -f1)"
+		selector="$(printf '%s' "$rest" | cut -f2)"
+		lhost="$(printf '%s' "$rest" | cut -f3)"
+		lport="$(printf '%s' "$rest" | cut -f4)"
+
+		case "$itype" in
+			i)
+				# Informational line, not a link
+				# shellcheck disable=SC2059
+				printf -- "%s\n" "$display" | fold -w "$width" -s | while IFS='' read -r txt
+				do
+					printf "%*s" "$margin" ""
+					# shellcheck disable=SC2059
+					printf -- "$sty_info%s\n\033[m" "$txt"
+				done
+				continue
+				;;
+			3)
+				# Error line
+				# shellcheck disable=SC2059
+				printf -- "%s\n" "$display" | fold -w "$width" -s | while IFS='' read -r txt
+				do
+					printf "%*s" "$margin" ""
+					# shellcheck disable=SC2059
+					printf -- "$sty_error%s\n\033[m" "$txt"
+				done
+				continue
+				;;
+			h)
+				# HTML / URL item; selector may be URL:http://...
+				case "$selector" in
+					"URL:"*)
+						linkurl="${selector#URL:}"
+						;;
+					*)
+						linkurl="gopher://$lhost:${lport:-70}/h$selector"
+						;;
+				esac
+				echo "$linkurl" >> "$linksfile"
+				linkcount=$((linkcount+1))
+				label="$(itype_label "$itype")"
+				sty="$sty_linkb${linkcount}$sty_html [$label]$sty_linkt"
+				;;
+			7)
+				# Search item
+				linkurl="gopher://$lhost:${lport:-70}/7$selector"
+				echo "SEARCH $linkurl" >> "$linksfile"
+				linkcount=$((linkcount+1))
+				label="$(itype_label "$itype")"
+				sty="$sty_linkb${linkcount}$sty_search [$label]$sty_searcht"
+				;;
+			1)
+				# Directory / menu
+				linkurl="gopher://$lhost:${lport:-70}/1$selector"
+				echo "$linkurl" >> "$linksfile"
+				linkcount=$((linkcount+1))
+				label="$(itype_label "$itype")"
+				sty="$sty_linkb${linkcount}$sty_dir [$label]$sty_linkt"
+				;;
+			0)
+				# Text file
+				linkurl="gopher://$lhost:${lport:-70}/0$selector"
+				echo "$linkurl" >> "$linksfile"
+				linkcount=$((linkcount+1))
+				label="$(itype_label "$itype")"
+				sty="$sty_linkb${linkcount}$sty_text [$label]$sty_linkt"
+				;;
+			9|4|5|6|g|I|s)
+				# Binary / media — link recorded but may not display well
+				linkurl="gopher://$lhost:${lport:-70}/$itype$selector"
+				echo "$linkurl" >> "$linksfile"
+				linkcount=$((linkcount+1))
+				label="$(itype_label "$itype")"
+				sty="$sty_linkb${linkcount}$sty_bin [$label]$sty_linkt"
+				;;
+			8|T)
+				# Telnet / tn3270 — not followed in-browser
+				linkurl="telnet://$lhost:${lport:-23}/"
+				echo "$linkurl" >> "$linksfile"
+				linkcount=$((linkcount+1))
+				label="$(itype_label "$itype")"
+				sty="$sty_linkb${linkcount}$sty_bin [$label]$sty_linkt"
+				;;
+			*)
+				# Unknown type — try as gopher link
+				linkurl="gopher://$lhost:${lport:-70}/$itype$selector"
+				echo "$linkurl" >> "$linksfile"
+				linkcount=$((linkcount+1))
+				label="$(itype_label "$itype")"
+				sty="$sty_linkb${linkcount}$sty_linkt"
+				;;
+		esac
+
+		# shellcheck disable=SC2059
+		printf -- "%s\n" "$display" | fold -w "$width" -s | while IFS='' read -r txt
+		do
+			printf "%*s" "$margin" ""
+			# shellcheck disable=SC2059
+			printf -- "$sty%s\n\033[m" "$txt"
+		done
+	done
+}
+
+typesettext() {
+	cols=$(tput cols)
+	# shellcheck disable=SC2154
+	width=$((cols - (2*margin)))
+
+	while IFS='' read -r line || [ -n "$line" ];
+	do
+		line="$(printf "%s" "$line" | tr -d '\r')"
+		# Text files may end with lone period
+		[ "$line" = "." ] && continue
+
+		printf -- "%s\n" "$line" | fold -w "$width" -s | while IFS='' read -r txt
+		do
+			printf "%*s%s\n" "$margin" "" "$txt"
+		done
+	done
+}
+
+# some help:
+# \033[;H	move to top
+# \033[NH 	move to bottom N lines
+# \033[?25l	hide cursor
+# \033[?25h	unhide cursor
+# \033[2K	erase line
+pager() {
+	clear
+
+	# hide cursor
+	printf '\033[?25l'
+
+	# lines columns
+	lines="$(tput lines)"
+	head -n "$((lines-1))" "$1"
+	l="$(wc -l < "$1")"
+	if [ "$lines" -lt "$l" ]; then pos="$lines"; else pos="$l"; fi
+
+	# stop echoing user input and read input unbufered
+	stty -echo -icanon min 1 time 0
+
+	# read inputs
+	while k="$(dd bs=1 count=1 status=none | od -c -An | tr -d ' ')"
+	do
+		case "$k" in
+		# command sequences
+		"033")
+			b="$(dd bs=2 count=1 status=none)"
+			case "$b" in
+				# up arrow
+				'[A')
+					[ "$pos" -le "$lines" ] && continue
+					line="$(sed "$((pos-lines))q;d" "$1")"
+					pos="$((pos-1))"
+					printf '\033[H\033[L%s\033[%sH\033[2K' "$line" "$lines"
+					;;
+				# down arrow
+				'[B')
+					[ "$pos" -ge "$l" ] && continue
+					printf '\033[%sH' "$lines"
+					sed "${pos}q;d" "$1"
+					pos="$((pos+1))"
+					;;
+				# page up
+				'[5')
+					# discard one extra byte
+					dd bs=1 count=1 status=none > /dev/null
+
+					[ "$pos" -le "$lines" ] && continue
+					scroll="$((pos-lines))"
+					[ "$scroll" -gt "$lines" ] && scroll="$((lines-1))"
+
+					# shellcheck disable=SC2086
+					for i in $(seq 1 "$scroll")
+					do
+						line="$(sed "$((pos-lines))q;d" "$1")"
+						pos="$((pos-1))"
+						printf '\033[H\033[L%s\033[%sH\033[2K' "$line" "$lines"
+					done
+					;;
+				# page down
+				'[6')
+					# discard one extra byte
+					dd bs=1 count=1 status=none > /dev/null
+
+					[ "$pos" -ge "$l" ] && continue
+					scroll="$((lines-1))"
+					end="$((pos+scroll))"
+					[ "$end" -ge "$l" ] && scroll="$((l-pos))"
+
+					# shellcheck disable=SC2086
+					for i in $(seq 1 "$scroll")
+					do
+						printf '\033[%sH' "$lines"
+						sed "${pos}q;d" "$1"
+						pos="$((pos+1))"
+					done
+					;;
+			esac ;;
+		"$quitkey") thetrap ;;
+		"$openkey")
+			printf '\033[%sH\033[?25h\033[2KType url: ' "$lines"
+			stty echo icanon
+			read -r url
+
+			# add gopher:// to begining if not (for convenience)
+			case "$url" in
+			       "gopher://"*) ;;
+			       *) url="gopher://$url" ;;
+			esac
+			return
+			;;
+		"$openlocalkey")
+			# Open local gopher menu / text file
+			printf '\033[?25h\033[2KType file path: '
+			stty echo
+			read -r file
+			if [ -f "$file" ]
+			then
+				typesetgopher < "$file" > "$pagefile"
+				pager "$pagefile"
+			fi
+			return
+			;;
+		"$refreshkey") return ;;
+		"$gokey")
+			printf '\033[?25h\033[2KEnter link number: '
+			stty echo icanon
+			read -r i
+			debug "selected $i"
+			linkentry="$(sed "${i}q;d" "$linksfile")"
+			case "$linkentry" in
+				"SEARCH "*)
+					searchurl="${linkentry#SEARCH }"
+					printf '\033[?25h\033[2KSearch query: '
+					read -r query
+					url="$searchurl"
+					gophersearch="$query"
+					;;
+				"telnet://"*)
+					printf '\033[?25h\033[2KTelnet links not supported in-browser: %s\nPress enter.' "$linkentry"
+					read -r _
+					return
+					;;
+				"http://"*|"https://"*)
+					printf '\033[?25h\033[2KHTTP links not supported in-browser: %s\nPress enter.' "$linkentry"
+					read -r _
+					return
+					;;
+				*)
+					url="$linkentry"
+					gophersearch=""
+					;;
+			esac
+			return
+			;;
+		"$backkey")
+			prev="$(getprevious)"
+			if [ -z "$prev" ]
+			then
+				printf '\033[%sH\033[2KNo previous page.' "$lines"
+				sleep 1
+				stty -echo -icanon min 1 time 0
+				printf '\033[?25l'
+				continue
+			fi
+			read -r proto host port itype selector <<- EOF
+			$prev
+			EOF
+			url="$proto://$host:$port/$itype$selector"
+			gophersearch=""
+			return
+			;;
+		"$homekey") url="$homepage"; gophersearch=""; return ;;
+		"$markkey")
+			printf '\033[?25h\033[KEnter description: (optional)'
+			stty echo icanon
+			read -r desc
+			echo "$url $desc" >> "$bookmarkfile"
+			return
+			;;
+		"$gomarkkey")
+			clear
+			if [ -f "$bookmarkfile" ]
+			then
+				cat -n "$bookmarkfile"
+			else
+				echo "(no bookmarks)"
+			fi
+			printf "\033[?25h\033[KEnter link number: "
+			stty echo icanon
+			read -r i
+			url="$(sed "${i}q;d" "$bookmarkfile" | cut -d' ' -f1)"
+			gophersearch=""
+			return
+			;;
+		"$delmarkkey")
+			if [ -f "$bookmarkfile" ]
+			then
+				grep -iv "^$url " "$bookmarkfile" > "$cachedir/bookmarks"
+				mv "$cachedir/bookmarks" "$bookmarkfile"
+			fi
+			return
+			;;
+		"$goupkey")
+			# Go up one path segment in the selector
+			if [ -n "$oldselector" ]
+			then
+				upsel="$(echo "$oldselector" | sed 's|/*[^/]*/*$||')"
+				url="gopher://$oldhost:${oldport:-70}/1$upsel"
+			else
+				url="gopher://$oldhost:${oldport:-70}/1/"
+			fi
+			gophersearch=""
+			return
+			;;
+		"$savekey")
+			printf '\033[?25h\033[2KSave to file: '
+			stty echo icanon
+			read -r savepath
+			if [ -n "$savepath" ]
+			then
+				cp "$rawfile" "$savepath" 2>/dev/null || cp "$pagefile" "$savepath"
+				printf '\033[2KSaved to %s. Press enter.' "$savepath"
+				read -r _
+			fi
+			stty -echo -icanon min 1 time 0
+			printf '\033[?25l'
+			;;
+		esac
+	done
+}
+
+# Send gopher request via netcat/openssl fallback
+# Parameters: host, port, selector_payload
+gopher_request() {
+	reqhost="$1"
+	reqport="$2"
+	reqsel="$3"
+
+	# Prefer nc/netcat; fall back to /dev/tcp via a tiny sh trick is not portable
+	if command -v nc >/dev/null 2>&1
+	then
+		printf '%s\r\n' "$reqsel" | nc -w 15 "$reqhost" "$reqport"
+	elif command -v netcat >/dev/null 2>&1
+	then
+		printf '%s\r\n' "$reqsel" | netcat -w 15 "$reqhost" "$reqport"
+	elif command -v ncat >/dev/null 2>&1
+	then
+		printf '%s\r\n' "$reqsel" | ncat -w 15 "$reqhost" "$reqport"
+	elif command -v socat >/dev/null 2>&1
+	then
+		printf '%s\r\n' "$reqsel" | socat -T15 - TCP:"$reqhost":"$reqport"
+	else
+		echo "geomys: need nc, netcat, ncat, or socat to connect" >&2
+		return 1
+	fi
+}
+
+# Fetches the gopher response from server
+# Parameters: proto, host, port, itype, selector
+fetch() {
+	if [ ! "$1" = "gopher" ]
+	then
+		echo "Only gopher links are supported."
+		echo "Type a key to continue."
+		read -r i
+		prev="$(getprevious)"
+		if [ -n "$prev" ]
+		then
+			read -r proto host port itype selector <<- EOF
+				$prev
+			EOF
+			url="$proto://$host:$port/$itype$selector"
+		else
+			url="$homepage"
+		fi
+		debug "previous page: $url"
+		return
+	fi
+
+	# Guard against empty/broken history restores
+	if [ -z "$2" ]
+	then
+		url="$homepage"
+		return
+	fi
+
+	debug "requesting $1://$2:$3/$4$5"
+
+	# set title
+	printf '\033]2;%s\007' "geomys (c): $2/$4$5"
+
+	echo "$1 $2 $3 $4 $5" >> "$histfile"
+
+	# Build selector for wire: search queries append TAB + query
+	wiresel="$5"
+	if [ "$4" = "7" ] && [ -n "$gophersearch" ]
+	then
+		wiresel="$5	$gophersearch"
+	fi
+
+	# Port display for URL
+	portdisp=""
+	[ "$3" != "70" ] && portdisp=":$3"
+	url="$1://$2$portdisp/$4$5"
+	[ "$trace" ] && echo "url: $url selector: $wiresel" >> "$tracefile"
+
+	if ! gopher_request "$2" "$3" "$wiresel" > "$rawfile" 2>/dev/null
+	then
+		echo "Connection failed to $2:$3" >&2
+		echo "Type a key to continue."
+		read -r i
+		prev="$(getprevious)"
+		if [ -n "$prev" ]
+		then
+			read -r proto host port itype selector <<- EOF
+				$prev
+			EOF
+			url="$proto://$host:$port/$itype$selector"
+		else
+			url="$homepage"
+		fi
+		return 0
+	fi
+
+	# Empty response?
+	if [ ! -s "$rawfile" ]
+	then
+		echo "Empty response from $2:$3" >&2
+		echo "Type a key to continue."
+		read -r i
+		prev="$(getprevious)"
+		if [ -n "$prev" ]
+		then
+			read -r proto host port itype selector <<- EOF
+				$prev
+			EOF
+			url="$proto://$host:$port/$itype$selector"
+		else
+			url="$homepage"
+		fi
+		return 0
+	fi
+
+	printf '\033]2;%s\007' "geomys (r): $2/$4$5"
+
+	# Success
+	oldhost="$2"
+	oldport="$3"
+	olditype="$4"
+	oldselector="$5"
+
+	printf '\033]2;%s\007' "geomys (t): $2/$4$5"
+	case "$4" in
+		1|7)
+			# Menu / search results
+			typesetgopher < "$rawfile" > "$pagefile"
+			;;
+		0)
+			# Text file
+			typesettext < "$rawfile" > "$pagefile"
+			# Text pages have no links
+			: > "$linksfile"
+			;;
+		3)
+			# Error — still try to render as menu
+			typesetgopher < "$rawfile" > "$pagefile"
+			;;
+		9|4|5|6|g|I|s)
+			# Binary / media — not rendered, offer save
+			clear
+			printf "Binary/media item (type %s): gopher://%s:%s/%s%s\n\n" "$4" "$2" "$3" "$4" "$5"
+			printf "Save to file? Enter path (or empty to skip): "
+			stty echo icanon
+			read -r savepath
+			if [ -n "$savepath" ]
+			then
+				cp "$rawfile" "$savepath"
+				printf "Saved %s bytes to %s\n" "$(wc -c < "$rawfile" | tr -d ' ')" "$savepath"
+			fi
+			printf "Press enter to go back."
+			read -r _
+			prev="$(getprevious)"
+			if [ -n "$prev" ]
+			then
+				read -r proto host port itype selector <<- EOF
+					$prev
+				EOF
+				url="$proto://$host:$port/$itype$selector"
+			else
+				url="$homepage"
+			fi
+			return 0
+			;;
+		h)
+			# HTML item — show raw or note unsupported
+			typesettext < "$rawfile" > "$pagefile"
+			: > "$linksfile"
+			;;
+		*)
+			# Default: try as menu
+			typesetgopher < "$rawfile" > "$pagefile"
+			;;
+	esac
+
+	debug "starting pager"
+	printf '\033]2;%s\007' "geomys (l): $2/$4$5"
+	gophersearch=""
+	pager "$pagefile"
+
+	debug "new url: $url"
+}
+
+# files are handled differently
+if [ "$file" ] && [ -f "$file" ]
+then
+	typesetgopher < "$file" > "$pagefile"
+	pager "$pagefile"
+fi
+
+# first request
+url="${url:-$homepage}"
+# ensure protocol prefix for homepage convenience
+case "$url" in
+	"gopher://"*) ;;
+	*) url="gopher://$url" ;;
+esac
+
+gophersearch=""
+while :
+do
+	printf '\033]2;%s\007' "geomys (w)"
+
+	# shellcheck disable=SC2046
+	fetch $(parseurl)
+done

@@ -1,0 +1,136 @@
+.TH GEOMYS "1" "June 2026" "geomys 0.1.0" "User Commands"
+.SH NAME
+geomys \- A Gopher web browser using shell script
+.SH SYNOPSIS
+.B geomys
+[\fI\,URL\/\fR]\fI\,|\/\fR[\fI\,OPTION\/\fR]
+.SH DESCRIPTION
+geomys v0.1.0: Browse the gopher web on any POSIX compatible terminal.
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+show this help
+.TP
+\fB\-v\fR, \fB\-\-version\fR
+show version info
+.SH COMMANDS
+These are the default keybindings to use while running geomys:
+.TP
+\fBq
+quit
+.TP
+\fBg
+go to a link
+.TP
+\fBr
+reload current page
+.TP
+\fBb
+go back one page
+.TP
+\fBu
+jump one path segment up
+.TP
+\fBo
+open an address
+.TP
+\fBs
+save current page
+.TP
+\fBH
+go to homepage
+.TP
+\fBm
+add bookmark
+.TP
+\fBM
+go to a bookmark
+.TP
+\fBK
+remove bookmark for current url
+.SH ENVIRONMENT
+Geomys uses 2 environment variables to help debugging and tracing its execution.
+.TP
+\fIdebug
+To start geomys in debug mode
+.TP
+\fItrace
+To start geomys with tracing activated
+.SH REQUIREMENTS
+Geomys needs one of \fBnc\fR, \fBnetcat\fR, \fBncat\fR, or \fBsocat\fR to open TCP
+connections to gopher servers (default port 70).
+.SH CONFIGURATION
+You can setup a config file at \fI$XDG_CONFIG_DIR/geomys/geomys.conf\fR to configure \fBgeomys\fR the way you like.
+The file uses a simple \fBkey=value\fR style, see the complete example for the default values below.
+.PP
+.EX
+margin=8
+homepage="gopher.floodgap.com/1/"
+sty_info='\e033[2m'
+sty_error='\e033[31;1m'
+sty_linkb='\e033[35m'
+sty_linkt=' => \e033[36;3m '
+sty_search='\e033[33;1m'
+sty_searcht=' ? \e033[36;3m '
+sty_dir='\e033[34;1m'
+sty_text='\e033[0m'
+sty_bin='\e033[31m'
+sty_html='\e033[32m'
+sty_image='\e033[33m'
+openkey='o'
+openlocalkey='O'
+gokey='g'
+refreshkey='r'
+backkey='b'
+quitkey='q'
+markkey='m'
+gomarkkey='M'
+delmarkkey='K'
+goupkey='u'
+homekey='H'
+savekey='s'
+.EE
+.SH GOPHER ITEM TYPES
+Menus show a short label before each link:
+.TP
+\fBTXT\fR (0)
+plain text file
+.TP
+\fBDIR\fR (1)
+gopher menu / directory
+.TP
+\fB???\fR (7)
+search item (prompts for a query)
+.TP
+\fBHTM\fR (h)
+HTML or external URL (not followed in-browser)
+.TP
+\fBBIN\fR / \fBGIF\fR / \fBIMG\fR
+binary or media; offered as a download
+.SH EXAMPLES
+.TP
+geomys
+Start browsing the default webpage
+.TP
+geomys gopher.floodgap.com
+Start browsing Floodgap
+.TP
+geomys gopher://gopherpedia.com/1/
+Open Gopherpedia
+.TP
+geomys \-\-help
+Show help
+.SH AUTHOR
+Written by Brian Lee Mayer.
+.SH "REPORTING BUGS"
+Report bugs to: bleemayer@gmail.com
+.br
+Home page: <https://www.github.com/blmayer/geomys/>
+.SH COPYRIGHT
+Copyright \(co 2026 Brian Mayer.
+License MIT: MIT License <https://opensource.org/licenses/MIT>
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+.SH SEE ALSO
+.BR ereandel (1)
