@@ -1,11 +1,11 @@
-.TH GEOMYS "1" "June 2026" "geomys 0.1.0" "User Commands"
+.TH GEOMYS "1" "July 2026" "geomys 0.2.0" "User Commands"
 .SH NAME
 geomys \- A Gopher web browser using shell script
 .SH SYNOPSIS
 .B geomys
 [\fI\,URL\/\fR]\fI\,|\/\fR[\fI\,OPTION\/\fR]
 .SH DESCRIPTION
-geomys v0.1.0: Browse the gopher web on any POSIX compatible terminal.
+geomys v0.2.0: Browse the gopher web on any POSIX compatible terminal.
 .SH OPTIONS
 .TP
 \fB\-h\fR, \fB\-\-help\fR
@@ -19,15 +19,25 @@ These are the default keybindings to use while running geomys:
 \fBq
 quit
 .TP
-\fBg
-go to a link
+\fB\uparrow/\downarrow
+select previous/next link (scroll on text pages)
+.TP
+\fB\leftarrow/\rightarrow
+go back/forward in history
+.TP
+\fBEnter
+follow the selected link
+.TP
+\fBPgUp/PgDn
+scroll the page
 .TP
 \fBr
 reload current page
 .TP
 \fBb
-go back one page
+go back one page (same as left arrow)
 .TP
+
 \fBu
 jump one path segment up
 .TP
@@ -68,18 +78,15 @@ margin=8
 homepage="gopher.floodgap.com/1/"
 sty_info='\e033[2m'
 sty_error='\e033[31;1m'
-sty_linkb='\e033[35m'
-sty_linkt=' => \e033[36;3m '
+sty_selected='\e033[7m'
 sty_search='\e033[33;1m'
-sty_searcht=' ? \e033[36;3m '
 sty_dir='\e033[34;1m'
-sty_text='\e033[0m'
+sty_text='\e033[39m'
 sty_bin='\e033[31m'
 sty_html='\e033[32m'
 sty_image='\e033[33m'
 openkey='o'
 openlocalkey='O'
-gokey='g'
 refreshkey='r'
 backkey='b'
 quitkey='q'
@@ -91,21 +98,25 @@ homekey='H'
 savekey='s'
 .EE
 .SH GOPHER ITEM TYPES
-Menus show a short label before each link:
+Menus render plain display text with no link numbers or arrow markers.
+Up/down move the selection; left/right move through history; Enter follows
+the selected link. Selection reverse video keeps the link's colors (for
+example a blue directory inverts as blue) and does not include the leading
+margin. Directories end with \fB/\fR.
 .TP
-\fBTXT\fR (0)
+type 0
 plain text file
 .TP
-\fBDIR\fR (1)
-gopher menu / directory
+type 1
+gopher menu / directory (name ends with /)
 .TP
-\fB???\fR (7)
+type 7
 search item (prompts for a query)
 .TP
-\fBHTM\fR (h)
+type h
 HTML or external URL (not followed in-browser)
 .TP
-\fBBIN\fR / \fBGIF\fR / \fBIMG\fR
+types 9, g, I
 binary or media; offered as a download
 .SH EXAMPLES
 .TP

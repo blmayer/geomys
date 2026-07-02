@@ -1,6 +1,6 @@
 #!/bin/sh
 
-version="0.1.0"
+version="0.2.0"
 
 usage() {
 	echo "geomys v$version: Browse the gopher web on the terminal."
@@ -18,7 +18,9 @@ usage() {
 	echo "These are the default keybindings to use while running geomys:"
 	echo ""
 	echo "  q	quit"
-	echo "  g	go to a link"
+	echo "  up/down	select previous/next link (scroll on text pages)"
+	echo "  left/right	go back/forward in history"
+	echo "  enter	follow the selected link"
 	echo "  r	reload current page"
 	echo "  b	go back one page"
 	echo "  u	jump one path segment up"
@@ -28,6 +30,7 @@ usage() {
 	echo "  m	add bookmark"
 	echo "  M	go to a bookmark"
 	echo "  K	remove bookmark for current url"
+	echo "  pgup/pgdn	scroll the page"
 	echo ""
 	echo "Examples:"
 	echo "  geomys		Start browsing the default webpage"
@@ -104,7 +107,6 @@ homepage="gopher.floodgap.com/1/"
 # keybindings
 openkey='o'
 openlocalkey='O'
-gokey='g'
 refreshkey='r'
 backkey='b'
 quitkey='q'
@@ -118,12 +120,10 @@ savekey='s'
 # styles
 sty_info='\033[2m'
 sty_error='\033[31;1m'
-sty_linkb='\033[35m'
-sty_linkt=' => \033[36;3m '
+sty_selected='\033[7m'
 sty_search='\033[33;1m'
-sty_searcht=' ? \033[36;3m '
 sty_dir='\033[34;1m'
-sty_text='\033[0m'
+sty_text='\033[39m'
 sty_bin='\033[31m'
 sty_html='\033[32m'
 sty_image='\033[33m'
@@ -142,7 +142,6 @@ then
 	# keybindings
 	openkey='o'
 	openlocalkey='O'
-	gokey='g'
 	refreshkey='r'
 	backkey='b'
 	quitkey='q'
@@ -156,12 +155,10 @@ then
 	# styles
 	sty_info='\033[2m'
 	sty_error='\033[31;1m'
-	sty_linkb='\033[35m'
-	sty_linkt=' => \033[36;3m '
+	sty_selected='\033[7m'
 	sty_search='\033[33;1m'
-	sty_searcht=' ? \033[36;3m '
 	sty_dir='\033[34;1m'
-	sty_text='\033[0m'
+	sty_text='\033[39m'
 	sty_bin='\033[31m'
 	sty_html='\033[32m'
 	sty_image='\033[33m'
@@ -171,17 +168,22 @@ fi
 # shellcheck source=/dev/null
 . "$configfile"
 
+# Defaults for options added after older config files were written
+[ -n "$sty_selected" ] || sty_selected='\033[7m'
+
 mkdir -p "$cachedir"
 pagefile="$(mktemp -p "$cachedir" -t curpage.XXXXXX)"
 rawfile="$(mktemp -p "$cachedir" -t rawpage.XXXXXX)"
 histfile="$(mktemp -p "$cachedir" -t history.XXXXXX)"
 linksfile="$(mktemp -p "$cachedir" -t links.XXXXXX)"
+linkmapfile="$(mktemp -p "$cachedir" -t linkmap.XXXXXX)"
+stylefile="$(mktemp -p "$cachedir" -t styles.XXXXXX)"
 tracefile="$(mktemp -p "$cachedir" -t trace.XXXXXX)"
 debug "read configs"
 
 # Restore terminal
 thetrap() {
-	rm -f "$histfile" "$linksfile" "$pagefile" "$rawfile" "$tracefile" > /dev/null 2>&1
+	rm -f "$histfile" "$linksfile" "$linkmapfile" "$stylefile" "$pagefile" "$rawfile" "$tracefile" > /dev/null 2>&1
 	tput rmcup
 	printf "\033[?25h"
 	stty echo
@@ -191,17 +193,74 @@ thetrap() {
 trap thetrap EXIT INT HUP
 
 # Drop last line of a file (portable; BSD sed -i needs '', GNU does not)
-droplast() {
-	[ -s "$1" ] || return
-	sed '$d' "$1" > "$1.tmp" && mv "$1.tmp" "$1"
+histpos=0
+histskip=""
+
+hist_count() {
+	if [ -f "$histfile" ]
+	then
+		wc -l < "$histfile" | tr -d ' '
+	else
+		echo 0
+	fi
 }
 
-getprevious() {
-	# Remove current page, then take and remove the previous entry
-	droplast "$histfile"
-	prev="$(tail -n 1 "$histfile" 2>/dev/null)"
-	droplast "$histfile"
-	echo "$prev"
+# Record a successful visit; drops any forward entries beyond histpos
+hist_push() {
+	if [ "$histpos" -gt 0 ] && [ -f "$histfile" ]
+	then
+		head -n "$histpos" "$histfile" > "$histfile.tmp" && mv "$histfile.tmp" "$histfile"
+	else
+		: > "$histfile"
+	fi
+	echo "$1 $2 $3 $4 $5" >> "$histfile"
+	histpos="$(hist_count)"
+}
+
+# Build url from a history line (proto host port itype selector)
+hist_entry_to_url() {
+	read -r _hp _hh _hpo _hi _hs <<- EOF
+	$1
+	EOF
+	_hdisp=""
+	[ "$_hpo" != "70" ] && _hdisp=":$_hpo"
+	echo "$_hp://$_hh$_hdisp/$_hi$_hs"
+}
+
+# Move history cursor by $1 (-1 back, +1 forward); sets url and histskip
+hist_navigate() {
+	_dir="$1"
+	_cnt="$(hist_count)"
+	[ "$_cnt" -lt 1 ] && return 1
+	_new=$((histpos + _dir))
+	[ "$_new" -lt 1 ] && return 1
+	[ "$_new" -gt "$_cnt" ] && return 1
+	histpos="$_new"
+	_entry="$(sed "${histpos}q;d" "$histfile")"
+	[ -z "$_entry" ] && return 1
+	url="$(hist_entry_to_url "$_entry")"
+	gophersearch=""
+	histskip=1
+	return 0
+}
+
+# Reload url from the current history position (e.g. after a failed fetch)
+hist_restore_current() {
+	if [ "$histpos" -ge 1 ]
+	then
+		_entry="$(sed "${histpos}q;d" "$histfile")"
+		if [ -n "$_entry" ]
+		then
+			url="$(hist_entry_to_url "$_entry")"
+			gophersearch=""
+			histskip=1
+			return 0
+		fi
+	fi
+	url="$homepage"
+	gophersearch=""
+	histskip=""
+	return 1
 }
 
 # Returns the complete url scheme with gopher defaults
@@ -263,35 +322,46 @@ parseurl() {
 	echo "${proto:-gopher}" "$host" "${port:-70}" "$itype" "$selector"
 }
 
-# Human-readable prefix for item types
-itype_label() {
-	case "$1" in
-		0) echo "TXT" ;;
-		1) echo "DIR" ;;
-		2) echo "CSO" ;;
-		3) echo "ERR" ;;
-		4) echo "HQX" ;;
-		5) echo "DOS" ;;
-		6) echo "UUE" ;;
-		7) echo "???" ;;
-		8) echo "TEL" ;;
-		9) echo "BIN" ;;
-		g) echo "GIF" ;;
-		h) echo "HTM" ;;
-		i) echo "   " ;;
-		I) echo "IMG" ;;
-		s) echo "SND" ;;
-		T) echo "3270" ;;
-		+) echo "DUP" ;;
-		*) echo "???" ;;
-	esac
+# Print margin-indented, folded plain text. Styles are applied at draw time
+# from stylefile so selection reverse video is not overridden by resets.
+# If pending_link is set, records the link and its inclusive line range.
+emit_text() {
+	_sty="$1"
+	_text="$2"
+	_start=$((pageline + 1))
+	printf -- "%s\n" "$_text" | fold -w "$width" -s | while IFS='' read -r txt
+	do
+		printf "%s\n" "$txt"
+	done
+	_nfolded="$(printf -- "%s\n" "$_text" | fold -w "$width" -s | wc -l | tr -d ' ')"
+	[ -z "$_text" ] && _nfolded=1
+	_j=0
+	while [ "$_j" -lt "$_nfolded" ]
+	do
+		printf '%s\n' "$_sty" >> "$stylefile"
+		_j=$((_j + 1))
+	done
+	pageline=$((pageline + _nfolded))
+	if [ -n "$pending_link" ]
+	then
+		echo "$pending_link" >> "$linksfile"
+		echo "$_start $pageline" >> "$linkmapfile"
+		pending_link=""
+	fi
+}
+
+# Queue a selectable link; finalized by the next emit_text call
+record_link() {
+	pending_link="$1"
 }
 
 typesetgopher() {
-	# some setup first
-	[ -f "$linksfile" ] && rm "$linksfile"
+	: > "$linksfile"
+	: > "$linkmapfile"
+	: > "$stylefile"
 	cols=$(tput cols)
-	linkcount="0"
+	pageline=0
+	pending_link=""
 
 	# shellcheck disable=SC2154
 	width=$((cols - (2*margin)))
@@ -316,103 +386,61 @@ typesetgopher() {
 
 		case "$itype" in
 			i)
-				# Informational line, not a link
-				# shellcheck disable=SC2059
-				printf -- "%s\n" "$display" | fold -w "$width" -s | while IFS='' read -r txt
-				do
-					printf "%*s" "$margin" ""
-					# shellcheck disable=SC2059
-					printf -- "$sty_info%s\n\033[m" "$txt"
-				done
+				pending_link=""
+				emit_text "$sty_info" "$display"
 				continue
 				;;
 			3)
-				# Error line
-				# shellcheck disable=SC2059
-				printf -- "%s\n" "$display" | fold -w "$width" -s | while IFS='' read -r txt
-				do
-					printf "%*s" "$margin" ""
-					# shellcheck disable=SC2059
-					printf -- "$sty_error%s\n\033[m" "$txt"
-				done
+				pending_link=""
+				emit_text "$sty_error" "$display"
 				continue
 				;;
 			h)
-				# HTML / URL item; selector may be URL:http://...
 				case "$selector" in
-					"URL:"*)
-						linkurl="${selector#URL:}"
-						;;
-					*)
-						linkurl="gopher://$lhost:${lport:-70}/h$selector"
-						;;
+					"URL:"*) linkurl="${selector#URL:}" ;;
+					*) linkurl="gopher://$lhost:${lport:-70}/h$selector" ;;
 				esac
-				echo "$linkurl" >> "$linksfile"
-				linkcount=$((linkcount+1))
-				label="$(itype_label "$itype")"
-				sty="$sty_linkb${linkcount}$sty_html [$label]$sty_linkt"
+				record_link "$linkurl"
+				emit_text "$sty_html" "$display"
 				;;
 			7)
-				# Search item
-				linkurl="gopher://$lhost:${lport:-70}/7$selector"
-				echo "SEARCH $linkurl" >> "$linksfile"
-				linkcount=$((linkcount+1))
-				label="$(itype_label "$itype")"
-				sty="$sty_linkb${linkcount}$sty_search [$label]$sty_searcht"
+				record_link "SEARCH gopher://$lhost:${lport:-70}/7$selector"
+				emit_text "$sty_search" "$display"
 				;;
 			1)
-				# Directory / menu
-				linkurl="gopher://$lhost:${lport:-70}/1$selector"
-				echo "$linkurl" >> "$linksfile"
-				linkcount=$((linkcount+1))
-				label="$(itype_label "$itype")"
-				sty="$sty_linkb${linkcount}$sty_dir [$label]$sty_linkt"
+				record_link "gopher://$lhost:${lport:-70}/1$selector"
+				case "$display" in
+					*/) emit_text "$sty_dir" "$display" ;;
+					*) emit_text "$sty_dir" "${display}/" ;;
+				esac
 				;;
 			0)
-				# Text file
-				linkurl="gopher://$lhost:${lport:-70}/0$selector"
-				echo "$linkurl" >> "$linksfile"
-				linkcount=$((linkcount+1))
-				label="$(itype_label "$itype")"
-				sty="$sty_linkb${linkcount}$sty_text [$label]$sty_linkt"
+				record_link "gopher://$lhost:${lport:-70}/0$selector"
+				emit_text "$sty_text" "$display"
 				;;
 			9|4|5|6|g|I|s)
-				# Binary / media — link recorded but may not display well
-				linkurl="gopher://$lhost:${lport:-70}/$itype$selector"
-				echo "$linkurl" >> "$linksfile"
-				linkcount=$((linkcount+1))
-				label="$(itype_label "$itype")"
-				sty="$sty_linkb${linkcount}$sty_bin [$label]$sty_linkt"
+				record_link "gopher://$lhost:${lport:-70}/$itype$selector"
+				case "$itype" in
+					g|I) emit_text "$sty_image" "$display" ;;
+					*) emit_text "$sty_bin" "$display" ;;
+				esac
 				;;
 			8|T)
-				# Telnet / tn3270 — not followed in-browser
-				linkurl="telnet://$lhost:${lport:-23}/"
-				echo "$linkurl" >> "$linksfile"
-				linkcount=$((linkcount+1))
-				label="$(itype_label "$itype")"
-				sty="$sty_linkb${linkcount}$sty_bin [$label]$sty_linkt"
+				record_link "telnet://$lhost:${lport:-23}/"
+				emit_text "$sty_bin" "$display"
 				;;
 			*)
-				# Unknown type — try as gopher link
-				linkurl="gopher://$lhost:${lport:-70}/$itype$selector"
-				echo "$linkurl" >> "$linksfile"
-				linkcount=$((linkcount+1))
-				label="$(itype_label "$itype")"
-				sty="$sty_linkb${linkcount}$sty_linkt"
+				record_link "gopher://$lhost:${lport:-70}/$itype$selector"
+				emit_text "$sty_text" "$display"
 				;;
 		esac
-
-		# shellcheck disable=SC2059
-		printf -- "%s\n" "$display" | fold -w "$width" -s | while IFS='' read -r txt
-		do
-			printf "%*s" "$margin" ""
-			# shellcheck disable=SC2059
-			printf -- "$sty%s\n\033[m" "$txt"
-		done
 	done
 }
 
 typesettext() {
+	: > "$linksfile"
+	: > "$linkmapfile"
+	: > "$stylefile"
 	cols=$(tput cols)
 	# shellcheck disable=SC2154
 	width=$((cols - (2*margin)))
@@ -425,97 +453,419 @@ typesettext() {
 
 		printf -- "%s\n" "$line" | fold -w "$width" -s | while IFS='' read -r txt
 		do
-			printf "%*s%s\n" "$margin" "" "$txt"
+			printf "%s\n" "$txt"
+		done
+		_nfolded="$(printf -- "%s\n" "$line" | fold -w "$width" -s | wc -l | tr -d ' ')"
+		[ -z "$line" ] && _nfolded=1
+		_j=0
+		while [ "$_j" -lt "$_nfolded" ]
+		do
+			printf '\n' >> "$stylefile"
+			_j=$((_j + 1))
 		done
 	done
 }
 
-# some help:
-# \033[;H	move to top
-# \033[NH 	move to bottom N lines
-# \033[?25l	hide cursor
-# \033[?25h	unhide cursor
-# \033[2K	erase line
-pager() {
+# Follow link index $1 from linksfile; sets url/gophersearch and returns 0 to leave pager
+follow_link() {
+	_idx="$1"
+	[ -z "$_idx" ] || [ "$_idx" -lt 1 ] && return 1
+	linkentry="$(sed "${_idx}q;d" "$linksfile")"
+	[ -z "$linkentry" ] && return 1
+	debug "following $linkentry"
+	case "$linkentry" in
+		"SEARCH "*)
+			searchurl="${linkentry#SEARCH }"
+			printf '\033[%sH\033[?25h\033[2KSearch query: ' "$lines"
+			stty echo icanon
+			read -r query
+			url="$searchurl"
+			gophersearch="$query"
+			;;
+		"telnet://"*)
+			printf '\033[%sH\033[?25h\033[2KTelnet links not supported in-browser: %s\nPress enter.' "$lines" "$linkentry"
+			stty echo icanon
+			read -r _
+			stty -echo -icanon min 1 time 0
+			printf '\033[?25l'
+			return 1
+			;;
+		"http://"*|"https://"*)
+			printf '\033[%sH\033[?25h\033[2KHTTP links not supported in-browser: %s\nPress enter.' "$lines" "$linkentry"
+			stty echo icanon
+			read -r _
+			stty -echo -icanon min 1 time 0
+			printf '\033[?25l'
+			return 1
+			;;
+		*)
+			url="$linkentry"
+			gophersearch=""
+			;;
+	esac
+	return 0
+}
+
+# Load selstart/selend for the current selected link index
+load_selection_range() {
+	selstart=0
+	selend=0
+	[ "$selected" -lt 1 ] && return
+	_range="$(sed "${selected}q;d" "$linkmapfile")"
+	[ -z "$_range" ] && return
+	selstart="$(echo "$_range" | cut -d' ' -f1)"
+	selend="$(echo "$_range" | cut -d' ' -f2)"
+	[ -z "$selend" ] && selend="$selstart"
+}
+
+pager_sync_viewend() {
+	contentrows=$((lines - 1))
+	[ "$contentrows" -lt 1 ] && contentrows=1
+	viewend=$((viewstart + contentrows - 1))
+	[ "$viewend" -gt "$l" ] && viewend="$l"
+	[ "$viewend" -lt 1 ] && viewend=0
+}
+
+# Compute viewstart needed to keep the selection visible (no side effects)
+pager_needed_viewstart() {
+	contentrows=$((lines - 1))
+	[ "$contentrows" -lt 1 ] && contentrows=1
+	_vs="$viewstart"
+	if [ "$selstart" -gt 0 ]
+	then
+		if [ "$selstart" -lt "$_vs" ]
+		then
+			_vs="$selstart"
+		elif [ "$selend" -gt $((_vs + contentrows - 1)) ]
+		then
+			_vs=$((selend - contentrows + 1))
+		fi
+	fi
+	[ "$_vs" -lt 1 ] && _vs=1
+	if [ "$l" -gt "$contentrows" ]
+	then
+		_maxstart=$((l - contentrows + 1))
+		[ "$_vs" -gt "$_maxstart" ] && _vs="$_maxstart"
+	else
+		_vs=1
+	fi
+	echo "$_vs"
+}
+
+pager_clear_status() {
+	printf '\033[%s;1H\033[2K' "$lines"
+}
+
+# Build a reverse-video variant of an SGR style, keeping its colors.
+# Styles are stored as printf escapes (e.g. \033[34;1m); invert merges ;7
+# into the SGR so a blue link becomes \033[34;1;7m (blue reversed), not plain B/W.
+style_invert() {
+	_base="$1"
+	# Drop reset-only SGR (literal \033 or real ESC) — nothing to invert
+	_base="$(printf '%s' "$_base" | sed -e 's/\\033\[0*m//g' -e "$(printf 's/\033\\[0*m//g')")"
+	if [ -z "$_base" ]
+	then
+		printf '%s' "$sty_selected"
+		return
+	fi
+	printf '%s' "$_base" | sed 's/m$/;7m/'
+}
+
+# Paint one page line at its current screen row.
+# Leading margin is never reversed — only the link text is.
+# Selection inverts the link's own colors instead of plain black/white reverse.
+paint_line() {
+	_lineno="$1"
+	[ "$_lineno" -lt 1 ] && return
+	_row=$((_lineno - viewstart + 1))
+	[ "$_row" -lt 1 ] || [ "$_row" -gt "$contentrows" ] && return
+
+	_line="$(sed "${_lineno}q;d" "$pagerfile")"
+	_sty="$(sed "${_lineno}q;d" "$stylefile" 2>/dev/null)"
+	printf '\033[%s;1H\033[2K' "$_row"
+	printf "%*s" "$margin" ""
+	if [ "$nlinks" -gt 0 ] && [ "$selstart" -gt 0 ] \
+		&& [ "$_lineno" -ge "$selstart" ] && [ "$_lineno" -le "$selend" ]
+	then
+		_selsty="$(style_invert "$_sty")"
+		# shellcheck disable=SC2059
+		printf -- "$_selsty%s\033[m" "$_line"
+	elif [ -n "$_sty" ]
+	then
+		# shellcheck disable=SC2059
+		printf -- "$_sty%s\033[m" "$_line"
+	else
+		printf '%s' "$_line"
+	fi
+}
+
+paint_range() {
+	_rfrom="$1"
+	_rto="$2"
+	[ "$_rfrom" -lt 1 ] && return
+	[ "$_rto" -lt "$_rfrom" ] && return
+	_ri="$_rfrom"
+	while [ "$_ri" -le "$_rto" ]
+	do
+		paint_line "$_ri"
+		_ri=$((_ri + 1))
+	done
+}
+
+# Full redraw — only for initial display or after overwriting the screen
+pager_draw() {
 	clear
-
-	# hide cursor
 	printf '\033[?25l'
-
-	# lines columns
 	lines="$(tput lines)"
-	head -n "$((lines-1))" "$1"
-	l="$(wc -l < "$1")"
-	if [ "$lines" -lt "$l" ]; then pos="$lines"; else pos="$l"; fi
+	contentrows=$((lines - 1))
+	[ "$contentrows" -lt 1 ] && contentrows=1
+	load_selection_range
+	viewstart="$(pager_needed_viewstart)"
+	pager_sync_viewend
 
-	# stop echoing user input and read input unbufered
+	_i="$viewstart"
+	while [ "$_i" -le "$viewend" ]
+	do
+		paint_line "$_i"
+		_i=$((_i + 1))
+	done
+	pager_clear_status
+}
+
+# Scroll the viewport by inserting/deleting lines; paints only entering lines
+pager_scroll_by() {
+	_delta="$1"
+	[ "$_delta" -eq 0 ] && return 0
+	contentrows=$((lines - 1))
+	[ "$contentrows" -lt 1 ] && contentrows=1
+	if [ "$l" -le "$contentrows" ]
+	then
+		[ "$viewstart" -eq 1 ] && return 1
+		viewstart=1
+		pager_sync_viewend
+		return 0
+	fi
+	_maxstart=$((l - contentrows + 1))
+	_target=$((viewstart + _delta))
+	[ "$_target" -lt 1 ] && _target=1
+	[ "$_target" -gt "$_maxstart" ] && _target="$_maxstart"
+	[ "$_target" -eq "$viewstart" ] && return 1
+
+	if [ "$_target" -gt "$viewstart" ]
+	then
+		_steps=$((_target - viewstart))
+		_s=0
+		while [ "$_s" -lt "$_steps" ]
+		do
+			printf '\033[1;1H\033[M'
+			viewstart=$((viewstart + 1))
+			pager_sync_viewend
+			paint_line "$viewend"
+			pager_clear_status
+			_s=$((_s + 1))
+		done
+	else
+		_steps=$((viewstart - _target))
+		_s=0
+		while [ "$_s" -lt "$_steps" ]
+		do
+			printf '\033[1;1H\033[L'
+			viewstart=$((viewstart - 1))
+			pager_sync_viewend
+			paint_line "$viewstart"
+			pager_clear_status
+			_s=$((_s + 1))
+		done
+	fi
+	return 0
+}
+
+# Move selection onto a link visible in the current viewport
+pager_select_visible() {
+	[ "$nlinks" -lt 1 ] && return
+	pager_sync_viewend
+	load_selection_range
+	if [ "$selstart" -ge "$viewstart" ] && [ "$selend" -le "$viewend" ]
+	then
+		return
+	fi
+	_old_s="$selstart"
+	_old_e="$selend"
+	_j=1
+	while [ "$_j" -le "$nlinks" ]
+	do
+		_range="$(sed "${_j}q;d" "$linkmapfile")"
+		_ls="$(echo "$_range" | cut -d' ' -f1)"
+		_le="$(echo "$_range" | cut -d' ' -f2)"
+		[ -z "$_le" ] && _le="$_ls"
+		if [ "$_ls" -ge "$viewstart" ] && [ "$_le" -le "$viewend" ]
+		then
+			selected="$_j"
+			selstart=0
+			selend=0
+			paint_range "$_old_s" "$_old_e"
+			load_selection_range
+			paint_range "$selstart" "$selend"
+			return
+		fi
+		_j=$((_j + 1))
+	done
+}
+
+# Arrow selection: repaint only old/new lines, scroll incrementally if needed
+pager_move_selection() {
+	_dir="$1"
+	[ "$nlinks" -lt 1 ] && return 1
+	_new=$((selected + _dir))
+	[ "$_new" -lt 1 ] && return 1
+	[ "$_new" -gt "$nlinks" ] && return 1
+
+	_old_s="$selstart"
+	_old_e="$selend"
+	_old_view="$viewstart"
+
+	selected="$_new"
+	load_selection_range
+	_need="$(pager_needed_viewstart)"
+
+	if [ "$_need" -eq "$_old_view" ]
+	then
+		selstart=0
+		selend=0
+		paint_range "$_old_s" "$_old_e"
+		load_selection_range
+		paint_range "$selstart" "$selend"
+	else
+		selstart=0
+		selend=0
+		paint_range "$_old_s" "$_old_e"
+		pager_scroll_by $((_need - _old_view))
+		load_selection_range
+		paint_range "$selstart" "$selend"
+	fi
+	return 0
+}
+
+# Page/line scroll for text pages or explicit page keys
+pager_scroll_and_select() {
+	_delta="$1"
+	_old_s="$selstart"
+	_old_e="$selend"
+	_old_sel="$selected"
+	if pager_scroll_by "$_delta"
+	then
+		if [ "$nlinks" -gt 0 ] && [ "$_old_sel" -gt 0 ]
+		then
+			# Attributes shift with scrolled cells; fix selection if it left the viewport
+			pager_sync_viewend
+			if [ "$_old_s" -lt "$viewstart" ] || [ "$_old_e" -gt "$viewend" ]
+			then
+				selected="$_old_sel"
+				selstart=0
+				selend=0
+				paint_range "$_old_s" "$_old_e"
+				selected="$_old_sel"
+				pager_select_visible
+			fi
+		fi
+	fi
+}
+
+pager() {
+	pagerfile="$1"
+	lines="$(tput lines)"
+	contentrows=$((lines - 1))
+	[ "$contentrows" -lt 1 ] && contentrows=1
+	l="$(wc -l < "$pagerfile" | tr -d ' ')"
+	[ -z "$l" ] && l=0
+	nlinks=0
+	[ -f "$linkmapfile" ] && nlinks="$(wc -l < "$linkmapfile" | tr -d ' ')"
+	[ -z "$nlinks" ] && nlinks=0
+
+	viewstart=1
+	viewend=0
+	selected=0
+	selstart=0
+	selend=0
+	if [ "$nlinks" -gt 0 ]
+	then
+		selected=1
+		load_selection_range
+	fi
+
 	stty -echo -icanon min 1 time 0
+	pager_draw
 
-	# read inputs
-	while k="$(dd bs=1 count=1 status=none | od -c -An | tr -d ' ')"
+	_nl="$(printf '\n')"
+	_cr="$(printf '\r')"
+	_esc="$(printf '\033')"
+
+	while k="$(dd bs=1 count=1 status=none 2>/dev/null)"
 	do
 		case "$k" in
-		# command sequences
-		"033")
-			b="$(dd bs=2 count=1 status=none)"
+		"$_esc")
+			b="$(dd bs=2 count=1 status=none 2>/dev/null)"
 			case "$b" in
-				# up arrow
 				'[A')
-					[ "$pos" -le "$lines" ] && continue
-					line="$(sed "$((pos-lines))q;d" "$1")"
-					pos="$((pos-1))"
-					printf '\033[H\033[L%s\033[%sH\033[2K' "$line" "$lines"
+					if [ "$nlinks" -gt 0 ]
+					then
+						pager_move_selection -1
+					else
+						pager_scroll_by -1
+					fi
 					;;
-				# down arrow
 				'[B')
-					[ "$pos" -ge "$l" ] && continue
-					printf '\033[%sH' "$lines"
-					sed "${pos}q;d" "$1"
-					pos="$((pos+1))"
+					if [ "$nlinks" -gt 0 ]
+					then
+						pager_move_selection 1
+					else
+						pager_scroll_by 1
+					fi
 					;;
-				# page up
+				'[C')
+					if hist_navigate 1
+					then
+						return
+					fi
+					printf '\033[%s;1H\033[2KNo next page.' "$lines"
+					sleep 1
+					printf '\033[?25l'
+					pager_clear_status
+					;;
+				'[D')
+					if hist_navigate -1
+					then
+						return
+					fi
+					printf '\033[%s;1H\033[2KNo previous page.' "$lines"
+					sleep 1
+					printf '\033[?25l'
+					pager_clear_status
+					;;
 				'[5')
-					# discard one extra byte
-					dd bs=1 count=1 status=none > /dev/null
-
-					[ "$pos" -le "$lines" ] && continue
-					scroll="$((pos-lines))"
-					[ "$scroll" -gt "$lines" ] && scroll="$((lines-1))"
-
-					# shellcheck disable=SC2086
-					for i in $(seq 1 "$scroll")
-					do
-						line="$(sed "$((pos-lines))q;d" "$1")"
-						pos="$((pos-1))"
-						printf '\033[H\033[L%s\033[%sH\033[2K' "$line" "$lines"
-					done
+					dd bs=1 count=1 status=none > /dev/null 2>&1
+					pager_scroll_and_select $((1 - contentrows))
 					;;
-				# page down
 				'[6')
-					# discard one extra byte
-					dd bs=1 count=1 status=none > /dev/null
-
-					[ "$pos" -ge "$l" ] && continue
-					scroll="$((lines-1))"
-					end="$((pos+scroll))"
-					[ "$end" -ge "$l" ] && scroll="$((l-pos))"
-
-					# shellcheck disable=SC2086
-					for i in $(seq 1 "$scroll")
-					do
-						printf '\033[%sH' "$lines"
-						sed "${pos}q;d" "$1"
-						pos="$((pos+1))"
-					done
+					dd bs=1 count=1 status=none > /dev/null 2>&1
+					pager_scroll_and_select "$contentrows"
 					;;
 			esac ;;
+		"$_nl"|"$_cr")
+			if [ "$nlinks" -gt 0 ] && [ "$selected" -gt 0 ]
+			then
+				if follow_link "$selected"
+				then
+					return
+				fi
+				pager_draw
+			fi
+			;;
 		"$quitkey") thetrap ;;
 		"$openkey")
-			printf '\033[%sH\033[?25h\033[2KType url: ' "$lines"
+			printf '\033[%s;1H\033[?25h\033[2KType url: ' "$lines"
 			stty echo icanon
 			read -r url
-
-			# add gopher:// to begining if not (for convenience)
 			case "$url" in
 			       "gopher://"*) ;;
 			       *) url="gopher://$url" ;;
@@ -523,9 +873,8 @@ pager() {
 			return
 			;;
 		"$openlocalkey")
-			# Open local gopher menu / text file
-			printf '\033[?25h\033[2KType file path: '
-			stty echo
+			printf '\033[%s;1H\033[?25h\033[2KType file path: ' "$lines"
+			stty echo icanon
 			read -r file
 			if [ -f "$file" ]
 			then
@@ -534,58 +883,21 @@ pager() {
 			fi
 			return
 			;;
-		"$refreshkey") return ;;
-		"$gokey")
-			printf '\033[?25h\033[2KEnter link number: '
-			stty echo icanon
-			read -r i
-			debug "selected $i"
-			linkentry="$(sed "${i}q;d" "$linksfile")"
-			case "$linkentry" in
-				"SEARCH "*)
-					searchurl="${linkentry#SEARCH }"
-					printf '\033[?25h\033[2KSearch query: '
-					read -r query
-					url="$searchurl"
-					gophersearch="$query"
-					;;
-				"telnet://"*)
-					printf '\033[?25h\033[2KTelnet links not supported in-browser: %s\nPress enter.' "$linkentry"
-					read -r _
-					return
-					;;
-				"http://"*|"https://"*)
-					printf '\033[?25h\033[2KHTTP links not supported in-browser: %s\nPress enter.' "$linkentry"
-					read -r _
-					return
-					;;
-				*)
-					url="$linkentry"
-					gophersearch=""
-					;;
-			esac
-			return
-			;;
+		"$refreshkey") histskip=1; return ;;
 		"$backkey")
-			prev="$(getprevious)"
-			if [ -z "$prev" ]
+			if hist_navigate -1
 			then
-				printf '\033[%sH\033[2KNo previous page.' "$lines"
-				sleep 1
-				stty -echo -icanon min 1 time 0
-				printf '\033[?25l'
-				continue
+				return
 			fi
-			read -r proto host port itype selector <<- EOF
-			$prev
-			EOF
-			url="$proto://$host:$port/$itype$selector"
-			gophersearch=""
-			return
+			printf '\033[%s;1H\033[2KNo previous page.' "$lines"
+			sleep 1
+			stty -echo -icanon min 1 time 0
+			printf '\033[?25l'
+			pager_clear_status
 			;;
 		"$homekey") url="$homepage"; gophersearch=""; return ;;
 		"$markkey")
-			printf '\033[?25h\033[KEnter description: (optional)'
+			printf '\033[%s;1H\033[?25h\033[2KEnter description: (optional) ' "$lines"
 			stty echo icanon
 			read -r desc
 			echo "$url $desc" >> "$bookmarkfile"
@@ -599,7 +911,7 @@ pager() {
 			else
 				echo "(no bookmarks)"
 			fi
-			printf "\033[?25h\033[KEnter link number: "
+			printf "\033[?25h\033[KEnter bookmark number: "
 			stty echo icanon
 			read -r i
 			url="$(sed "${i}q;d" "$bookmarkfile" | cut -d' ' -f1)"
@@ -615,7 +927,6 @@ pager() {
 			return
 			;;
 		"$goupkey")
-			# Go up one path segment in the selector
 			if [ -n "$oldselector" ]
 			then
 				upsel="$(echo "$oldselector" | sed 's|/*[^/]*/*$||')"
@@ -627,7 +938,7 @@ pager() {
 			return
 			;;
 		"$savekey")
-			printf '\033[?25h\033[2KSave to file: '
+			printf '\033[%s;1H\033[?25h\033[2KSave to file: ' "$lines"
 			stty echo icanon
 			read -r savepath
 			if [ -n "$savepath" ]
@@ -638,6 +949,7 @@ pager() {
 			fi
 			stty -echo -icanon min 1 time 0
 			printf '\033[?25l'
+			pager_draw
 			;;
 		esac
 	done
@@ -677,16 +989,7 @@ fetch() {
 		echo "Only gopher links are supported."
 		echo "Type a key to continue."
 		read -r i
-		prev="$(getprevious)"
-		if [ -n "$prev" ]
-		then
-			read -r proto host port itype selector <<- EOF
-				$prev
-			EOF
-			url="$proto://$host:$port/$itype$selector"
-		else
-			url="$homepage"
-		fi
+		hist_restore_current
 		debug "previous page: $url"
 		return
 	fi
@@ -695,6 +998,7 @@ fetch() {
 	if [ -z "$2" ]
 	then
 		url="$homepage"
+		histskip=""
 		return
 	fi
 
@@ -703,7 +1007,12 @@ fetch() {
 	# set title
 	printf '\033]2;%s\007' "geomys (c): $2/$4$5"
 
-	echo "$1 $2 $3 $4 $5" >> "$histfile"
+	_hist_record=1
+	if [ -n "$histskip" ]
+	then
+		_hist_record=0
+		histskip=""
+	fi
 
 	# Build selector for wire: search queries append TAB + query
 	wiresel="$5"
@@ -723,16 +1032,7 @@ fetch() {
 		echo "Connection failed to $2:$3" >&2
 		echo "Type a key to continue."
 		read -r i
-		prev="$(getprevious)"
-		if [ -n "$prev" ]
-		then
-			read -r proto host port itype selector <<- EOF
-				$prev
-			EOF
-			url="$proto://$host:$port/$itype$selector"
-		else
-			url="$homepage"
-		fi
+		hist_restore_current
 		return 0
 	fi
 
@@ -742,22 +1042,18 @@ fetch() {
 		echo "Empty response from $2:$3" >&2
 		echo "Type a key to continue."
 		read -r i
-		prev="$(getprevious)"
-		if [ -n "$prev" ]
-		then
-			read -r proto host port itype selector <<- EOF
-				$prev
-			EOF
-			url="$proto://$host:$port/$itype$selector"
-		else
-			url="$homepage"
-		fi
+		hist_restore_current
 		return 0
 	fi
 
 	printf '\033]2;%s\007' "geomys (r): $2/$4$5"
 
-	# Success
+	# Success — record history for normal navigation only
+	if [ "$_hist_record" -eq 1 ]
+	then
+		hist_push "$1" "$2" "$3" "$4" "$5"
+	fi
+
 	oldhost="$2"
 	oldport="$3"
 	olditype="$4"
@@ -772,8 +1068,6 @@ fetch() {
 		0)
 			# Text file
 			typesettext < "$rawfile" > "$pagefile"
-			# Text pages have no links
-			: > "$linksfile"
 			;;
 		3)
 			# Error — still try to render as menu
@@ -793,22 +1087,15 @@ fetch() {
 			fi
 			printf "Press enter to go back."
 			read -r _
-			prev="$(getprevious)"
-			if [ -n "$prev" ]
+			if ! hist_navigate -1
 			then
-				read -r proto host port itype selector <<- EOF
-					$prev
-				EOF
-				url="$proto://$host:$port/$itype$selector"
-			else
-				url="$homepage"
+				hist_restore_current
 			fi
 			return 0
 			;;
 		h)
 			# HTML item — show raw or note unsupported
 			typesettext < "$rawfile" > "$pagefile"
-			: > "$linksfile"
 			;;
 		*)
 			# Default: try as menu
